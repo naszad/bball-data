@@ -351,12 +351,21 @@ Turnovers/Game: {offense['turnovers']['total'] / team_data['games']:.1f}
         if not data or 'betting_lines' not in data or not isinstance(data['betting_lines'], pd.DataFrame):
             tk.Label(scroll.scrollable_frame, text="No betting lines data available").pack()
             return
+        
+        # Create frames
         control_frame = ttk.Frame(scroll.scrollable_frame)
         control_frame.pack(fill='x', padx=10, pady=5)
         content_frame = ttk.Frame(scroll.scrollable_frame)
         content_frame.pack(fill='both', expand=True, padx=10, pady=5)
         content_frame.grid_columnconfigure(0, weight=1)
         content_frame.grid_columnconfigure(1, weight=1)
+        
+        # Variables for range control
+        x_min_var = tk.DoubleVar(value=0)
+        x_max_var = tk.DoubleVar(value=200)
+        y_min_var = tk.DoubleVar(value=0)
+        y_max_var = tk.DoubleVar(value=200)
+        
         def update_analysis(*args):
             for widget in content_frame.winfo_children():
                 widget.destroy()
@@ -423,22 +432,75 @@ Average Over/Under: {avg_over_under:.1f}
             
             # Create scatter plot of actual total scores vs over/under
             if 'homeScore' in lines_df.columns and 'awayScore' in lines_df.columns:
-                fig3, ax3 = plt.subplots(figsize=(12, 4))
-                total_scores = lines_df['homeScore'] + lines_df['awayScore']
-                ax3.scatter(lines_df['overUnder'], total_scores, color='darkgreen', alpha=0.6)
+                scatter_control_frame = ttk.LabelFrame(content_frame, text="Scatter Plot Controls", padding=10)
+                scatter_control_frame.grid(row=2, column=0, columnspan=2, padx=5, pady=5, sticky='nsew')
                 
-                # Add diagonal line for reference
-                min_val = min(lines_df['overUnder'].min(), total_scores.min())
-                max_val = max(lines_df['overUnder'].max(), total_scores.max())
-                ax3.plot([min_val, max_val], [min_val, max_val], 'r--', alpha=0.5)
+                # X-axis range controls
+                x_frame = ttk.Frame(scatter_control_frame)
+                x_frame.pack(fill='x', padx=5, pady=2)
+                ttk.Label(x_frame, text="Over/Under Range:").pack(side='left', padx=5)
+                x_min_entry = ttk.Entry(x_frame, textvariable=x_min_var, width=8)
+                x_min_entry.pack(side='left', padx=5)
+                ttk.Label(x_frame, text="to").pack(side='left', padx=5)
+                x_max_entry = ttk.Entry(x_frame, textvariable=x_max_var, width=8)
+                x_max_entry.pack(side='left', padx=5)
                 
-                ax3.set_title("Actual Total Score vs Over/Under Line")
-                ax3.set_xlabel("Over/Under Line")
-                ax3.set_ylabel("Actual Total Score")
-                plt.tight_layout()
-                canvas3 = FigureCanvasTkAgg(fig3, master=content_frame)
-                canvas3.draw()
-                canvas3.get_tk_widget().grid(row=2, column=0, columnspan=2, padx=5, pady=5, sticky='nsew')
+                # Y-axis range controls
+                y_frame = ttk.Frame(scatter_control_frame)
+                y_frame.pack(fill='x', padx=5, pady=2)
+                ttk.Label(y_frame, text="Total Score Range:").pack(side='left', padx=5)
+                y_min_entry = ttk.Entry(y_frame, textvariable=y_min_var, width=8)
+                y_min_entry.pack(side='left', padx=5)
+                ttk.Label(y_frame, text="to").pack(side='left', padx=5)
+                y_max_entry = ttk.Entry(y_frame, textvariable=y_max_var, width=8)
+                y_max_entry.pack(side='left', padx=5)
+                
+                def update_scatter(*args):
+                    try:
+                        x_min = float(x_min_var.get())
+                        x_max = float(x_max_var.get())
+                        y_min = float(y_min_var.get())
+                        y_max = float(y_max_var.get())
+                        
+                        # Update scatter plot
+                        total_scores = lines_df['homeScore'] + lines_df['awayScore']
+                        
+                        # Clear previous plot
+                        for widget in scatter_frame.winfo_children():
+                            widget.destroy()
+                        
+                        fig3, ax3 = plt.subplots(figsize=(12, 4))
+                        ax3.scatter(lines_df['overUnder'], total_scores, color='darkgreen', alpha=0.6)
+                        
+                        # Add diagonal line for reference
+                        min_val = max(min(x_min, y_min), min(lines_df['overUnder'].min(), total_scores.min()))
+                        max_val = min(max(x_max, y_max), max(lines_df['overUnder'].max(), total_scores.max()))
+                        ax3.plot([min_val, max_val], [min_val, max_val], 'r--', alpha=0.5)
+                        
+                        ax3.set_title("Actual Total Score vs Over/Under Line")
+                        ax3.set_xlabel("Over/Under Line")
+                        ax3.set_ylabel("Actual Total Score")
+                        ax3.set_xlim(x_min, x_max)
+                        ax3.set_ylim(y_min, y_max)
+                        plt.tight_layout()
+                        
+                        canvas3 = FigureCanvasTkAgg(fig3, master=scatter_frame)
+                        canvas3.draw()
+                        canvas3.get_tk_widget().pack(fill='both', expand=True, padx=5, pady=5)
+                    except ValueError:
+                        messagebox.showerror("Error", "Please enter valid numbers for the ranges")
+                
+                # Add update button
+                update_btn = ttk.Button(scatter_control_frame, text="Update Plot", command=update_scatter)
+                update_btn.pack(pady=5)
+                
+                # Frame for scatter plot
+                scatter_frame = ttk.Frame(content_frame)
+                scatter_frame.grid(row=3, column=0, columnspan=2, padx=5, pady=5, sticky='nsew')
+                
+                # Initialize scatter plot
+                update_scatter()
+                
         update_analysis()
 
     def create_win_loss_tab(self, data):
@@ -578,85 +640,115 @@ Away Win %: {(away_wins / total_games * 100):.1f}%
         if not data or 'team_stats' not in data or not isinstance(data['team_stats'], pd.DataFrame):
             tk.Label(scroll.scrollable_frame, text="No team stats data available for correlation analysis").pack()
             return
+        
         control_frame = ttk.Frame(scroll.scrollable_frame)
         control_frame.pack(fill='x', padx=10, pady=5)
         metric_label = ttk.Label(control_frame, text="Select Metrics:")
         metric_label.pack(side='left', padx=5)
         metric_var = tk.StringVar(value='Basic Stats')
         metric_combo = ttk.Combobox(control_frame, textvariable=metric_var, 
-                                      values=['Basic Stats', 'Offensive Stats', 'Shooting Stats', 'Advanced Stats'])
+                                  values=['Basic Stats', 'Offensive Stats', 'Shooting Stats', 'Advanced Stats'])
         metric_combo.pack(side='left', padx=5)
         content_frame = ttk.Frame(scroll.scrollable_frame)
         content_frame.pack(fill='both', expand=True, padx=10, pady=5)
+        
+        def safe_get(row, *keys, default=0):
+            """Safely get nested dictionary values with a default"""
+            value = row
+            for key in keys:
+                if isinstance(value, dict) and key in value:
+                    value = value[key]
+                else:
+                    return default
+            return value if value is not None else default
+        
+        def safe_divide(a, b, default=0):
+            """Safely divide two numbers, returning default if division is impossible"""
+            try:
+                if b == 0 or pd.isna(b) or pd.isna(a):
+                    return default
+                return a / b
+            except (TypeError, ZeroDivisionError):
+                return default
+        
         def update_correlation(*args):
             for widget in content_frame.winfo_children():
                 widget.destroy()
+            
             team_stats = data['team_stats'].copy()
             selected_metrics = metric_var.get()
+            
             if selected_metrics == 'Basic Stats':
                 metrics_df = pd.DataFrame({
                     'Wins': team_stats['wins'],
                     'Losses': team_stats['losses'],
-                    'Win Rate': team_stats['wins'] / (team_stats['wins'] + team_stats['losses']),
+                    'Win Rate': team_stats.apply(lambda x: safe_divide(x['wins'], (x['wins'] + x['losses'])) * 100, axis=1),
                     'Games': team_stats['games'],
-                    'Pace': team_stats['pace']
+                    'Pace': team_stats['pace'],
+                    'Points/Game': team_stats.apply(lambda x: safe_divide(safe_get(x, 'offense', 'points', 'total'), x['games']), axis=1)
                 })
-                if 'offense' in team_stats.columns:
-                    metrics_df['Points/Game'] = team_stats.apply(
-                        lambda x: x['offense']['points']['total'] / x['games'] if isinstance(x['offense'], dict) else None,
-                        axis=1
-                    )
+            
             elif selected_metrics == 'Offensive Stats':
-                metrics_df = pd.DataFrame()
-                def safe_get(row, *keys):
-                    value = row
-                    for key in keys:
-                        if isinstance(value, dict) and key in value:
-                            value = value[key]
-                        else:
-                            return None
-                    return value
-                metrics_df['Points/Game'] = team_stats.apply(lambda x: safe_get(x, 'offense', 'points', 'total') / x['games'], axis=1)
-                metrics_df['Assists/Game'] = team_stats.apply(lambda x: safe_get(x, 'offense', 'assists') / x['games'], axis=1)
-                metrics_df['Turnovers/Game'] = team_stats.apply(lambda x: safe_get(x, 'offense', 'turnovers', 'total') / x['games'], axis=1)
-                metrics_df['Off Reb/Game'] = team_stats.apply(lambda x: safe_get(x, 'offense', 'rebounds', 'offensive') / x['games'], axis=1)
-                metrics_df['Def Reb/Game'] = team_stats.apply(lambda x: safe_get(x, 'offense', 'rebounds', 'defensive') / x['games'], axis=1)
+                metrics_df = pd.DataFrame({
+                    'Points/Game': team_stats.apply(lambda x: safe_divide(safe_get(x, 'offense', 'points', 'total'), x['games']), axis=1),
+                    'Assists/Game': team_stats.apply(lambda x: safe_divide(safe_get(x, 'offense', 'assists'), x['games']), axis=1),
+                    'Turnovers/Game': team_stats.apply(lambda x: safe_divide(safe_get(x, 'offense', 'turnovers', 'total'), x['games']), axis=1),
+                    'Off Reb/Game': team_stats.apply(lambda x: safe_divide(safe_get(x, 'offense', 'rebounds', 'offensive'), x['games']), axis=1),
+                    'Def Reb/Game': team_stats.apply(lambda x: safe_divide(safe_get(x, 'offense', 'rebounds', 'defensive'), x['games']), axis=1)
+                })
+            
             elif selected_metrics == 'Shooting Stats':
-                metrics_df = pd.DataFrame()
-                metrics_df['FG%'] = team_stats.apply(lambda x: x['offense']['fieldGoals']['pct'] if isinstance(x['offense'], dict) else None, axis=1)
-                metrics_df['3P%'] = team_stats.apply(lambda x: x['offense']['threePointFieldGoals']['pct'] if isinstance(x['offense'], dict) else None, axis=1)
-                metrics_df['2P%'] = team_stats.apply(lambda x: x['offense']['twoPointFieldGoals']['pct'] if isinstance(x['offense'], dict) else None, axis=1)
-                metrics_df['FT%'] = team_stats.apply(lambda x: x['offense']['freeThrows']['pct'] if isinstance(x['offense'], dict) else None, axis=1)
-                metrics_df['True Shooting%'] = team_stats.apply(lambda x: x['offense']['trueShooting'] if isinstance(x['offense'], dict) else None, axis=1)
-            else:
-                metrics_df = pd.DataFrame()
-                metrics_df['Pace'] = team_stats['pace']
-                metrics_df['Off Rating'] = team_stats.apply(lambda x: x['offense']['rating'] if isinstance(x['offense'], dict) else None, axis=1)
-                metrics_df['eFG%'] = team_stats.apply(lambda x: x['offense']['fourFactors']['effectiveFieldGoalPct'] if isinstance(x['offense'], dict) else None, axis=1)
-                metrics_df['TO Ratio'] = team_stats.apply(lambda x: x['offense']['fourFactors']['turnoverRatio'] if isinstance(x['offense'], dict) else None, axis=1)
-                metrics_df['Off Reb%'] = team_stats.apply(lambda x: x['offense']['fourFactors']['offensiveReboundPct'] if isinstance(x['offense'], dict) else None, axis=1)
-            metrics_df = metrics_df.dropna()
+                metrics_df = pd.DataFrame({
+                    'FG%': team_stats.apply(lambda x: safe_get(x, 'offense', 'fieldGoals', 'pct', default=0), axis=1),
+                    '3P%': team_stats.apply(lambda x: safe_get(x, 'offense', 'threePointFieldGoals', 'pct', default=0), axis=1),
+                    '2P%': team_stats.apply(lambda x: safe_get(x, 'offense', 'twoPointFieldGoals', 'pct', default=0), axis=1),
+                    'FT%': team_stats.apply(lambda x: safe_get(x, 'offense', 'freeThrows', 'pct', default=0), axis=1),
+                    'True Shooting%': team_stats.apply(lambda x: safe_get(x, 'offense', 'trueShooting', default=0), axis=1)
+                })
+            
+            else:  # Advanced Stats
+                metrics_df = pd.DataFrame({
+                    'Pace': team_stats['pace'],
+                    'Off Rating': team_stats.apply(lambda x: safe_get(x, 'offense', 'rating', default=0), axis=1),
+                    'eFG%': team_stats.apply(lambda x: safe_get(x, 'offense', 'fourFactors', 'effectiveFieldGoalPct', default=0), axis=1),
+                    'TO Ratio': team_stats.apply(lambda x: safe_get(x, 'offense', 'fourFactors', 'turnoverRatio', default=0), axis=1),
+                    'Off Reb%': team_stats.apply(lambda x: safe_get(x, 'offense', 'fourFactors', 'offensiveReboundPct', default=0), axis=1)
+                })
+            
+            # Drop rows with all zeros (likely invalid data)
+            metrics_df = metrics_df.loc[~(metrics_df == 0).all(axis=1)]
+            
             if metrics_df.empty:
                 tk.Label(content_frame, text="No valid data available for selected metrics").pack()
                 return
+            
+            # Calculate correlation matrix
             corr_matrix = metrics_df.corr()
+            
             fig, ax = plt.subplots(figsize=(10, 8))
             im = ax.imshow(corr_matrix, cmap='coolwarm', aspect='auto')
             plt.colorbar(im, ax=ax)
+            
+            # Set labels
             ax.set_xticks(np.arange(len(corr_matrix.columns)))
             ax.set_yticks(np.arange(len(corr_matrix.columns)))
             ax.set_xticklabels(corr_matrix.columns, rotation=45, ha='right')
             ax.set_yticklabels(corr_matrix.columns)
+            
+            # Add correlation values in cells
             for i in range(len(corr_matrix.columns)):
                 for j in range(len(corr_matrix.columns)):
                     ax.text(j, i, f'{corr_matrix.iloc[i, j]:.2f}',
-                            ha='center', va='center',
-                            color='white' if abs(corr_matrix.iloc[i, j]) > 0.5 else 'black')
+                           ha='center', va='center',
+                           color='white' if abs(corr_matrix.iloc[i, j]) > 0.5 else 'black')
+            
             ax.set_title(f"Correlation Heatmap - {selected_metrics}")
             plt.tight_layout()
+            
             canvas = FigureCanvasTkAgg(fig, master=content_frame)
             canvas.draw()
             canvas.get_tk_widget().pack(fill='both', expand=True, padx=5, pady=5)
+            
             explanation = """
 Correlation Coefficient Guide:
 1.0 = Perfect positive correlation
@@ -665,6 +757,7 @@ Correlation Coefficient Guide:
 Strong correlations (>0.5 or <-0.5) are shown in white text.
 """
             tk.Label(content_frame, text=explanation, justify='left').pack(padx=10, pady=5)
+        
         metric_combo.bind('<<ComboboxSelected>>', update_correlation)
         update_correlation()
 

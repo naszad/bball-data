@@ -4,7 +4,7 @@ import json
 import statistics
 import os
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 from dotenv import load_dotenv
 import logging
 import urllib.parse
@@ -15,6 +15,9 @@ import tkinter as tk
 from tkinter import ttk, messagebox
 import threading
 import queue
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 # Configure logging
 logging.basicConfig(
@@ -247,6 +250,30 @@ class BasketballDataCollector:
         # Store progress window reference
         self.progress_window = progress_window
         self.max_teams = 0
+        
+        # Initialize progress tracking
+        self.completed_operations = 0
+        self.total_operations = 100  # Default value, can be updated based on actual operations
+        
+        # Cache for loaded data
+        self.cache = {}
+        
+        # Create session with retries
+        self.session = self._create_session()
+
+    def _create_session(self) -> requests.Session:
+        """Create a session with retry strategy to handle rate limits and transient errors."""
+        session = requests.Session()
+        retry_strategy = Retry(
+            total=5,  # increased number of retries
+            backoff_factor=1.0,  # increased backoff factor
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=["HEAD", "GET", "OPTIONS"]
+        )
+        adapter = HTTPAdapter(max_retries=retry_strategy, pool_connections=25, pool_maxsize=25)
+        session.mount("https://", adapter)
+        session.headers.update(self.headers)
+        return session
 
     def _format_season(self, season: str) -> str:
         """Format season string correctly for API"""
@@ -268,11 +295,11 @@ class BasketballDataCollector:
         # Do not URL encode - the requests library will handle that
         return formatted
 
-    def _increment_progress(self, amount=1):
-        """Increment progress by the smallest operation unit"""
-        self.completed_operations += amount
-        if self.total_operations > 0:
-            progress = (self.completed_operations / self.total_operations) * 100
+    def _increment_progress(self, increment: float):
+        """Increment the progress by the specified amount"""
+        if self.progress_window:
+            self.completed_operations += increment
+            progress = min(100, (self.completed_operations / self.total_operations) * 100)
             self.progress_window.update(progress=progress)
 
     def _make_request(self, endpoint: str, params: Dict = None) -> Optional[Dict]:
@@ -310,7 +337,7 @@ class BasketballDataCollector:
             self._increment_progress(0.2)
             
             # Let requests handle URL encoding of parameters
-            response = requests.get(url, headers=self.headers, params=params)
+            response = self.session.get(url, params=params)
             
             # Log the actual URL that was requested (after encoding)
             logging.info(f"Full URL after encoding: {response.url}")
@@ -350,6 +377,40 @@ class BasketballDataCollector:
             logging.error(f"Unexpected error in request to {endpoint}: {str(e)}")
             return None
 
+    def _load_cached_data(self, data_type: str, season: str) -> List[Dict]:
+        """Load data from cache or file if available"""
+        cache_key = f"{season}_{data_type}"
+        
+        # Check memory cache first
+        if cache_key in self.cache:
+            logging.info(f"Using memory cache for {cache_key}")
+            return self.cache[cache_key]
+        
+        # Try loading from file
+        json_file = os.path.join(self.output_dir, f"{cache_key}.json")
+        if os.path.exists(json_file):
+            try:
+                with open(json_file, 'r') as f:
+                    data = json.load(f)
+                    self.cache[cache_key] = data  # Store in memory cache
+                    logging.info(f"Loaded cached data from {json_file}")
+                    return data
+            except Exception as e:
+                logging.error(f"Error loading cached data from {json_file}: {str(e)}")
+        
+        return None
+    
+    def _save_to_cache(self, data: List[Dict], data_type: str, season: str):
+        """Save data to both memory cache and file"""
+        cache_key = f"{season}_{data_type}"
+        self.cache[cache_key] = data
+        
+        # Also save to file
+        json_file = os.path.join(self.output_dir, f"{cache_key}.json")
+        with open(json_file, 'w') as f:
+            json.dump(data, f, indent=2)
+        logging.info(f"Saved data to cache: {cache_key}")
+
     def get_teams(self, season: Optional[str] = None) -> List[Dict]:
         """Get list of teams with optional season filter"""
         try:
@@ -374,35 +435,47 @@ class BasketballDataCollector:
             return []
 
     def get_team_stats(self, season: str, team: Optional[str] = None) -> List[Dict]:
-        """Get team season statistics"""
-        try:
-            formatted_team = self._format_team_name(team) if team else None
-            logging.info(f"Getting stats for team: {team} (formatted: {formatted_team})")
+        """Get team season statistics with caching"""
+        # Try to get from cache first
+        cached_data = self._load_cached_data("team_stats", season)
+        if cached_data is not None and team:
+            # Filter cached data for specific team
+            team_stats = [s for s in cached_data if s.get('team') == team]
+            if team_stats:
+                logging.info(f"Using cached team stats for {team}")
+                return team_stats
+        
+        # If no cache or team not found, fetch from API
+        formatted_team = self._format_team_name(team) if team else None
+        params = {
+            "season": season,
+            "team": formatted_team,
+            "seasonType": "regular"
+        }
+        
+        stats = self._make_request("stats/team/season", params) or []
+        
+        if stats:
+            # Update cache if fetching all teams
+            if not team:
+                self._save_to_cache(stats, "team_stats", season)
             
-            params = {
-                "season": season,
-                "team": formatted_team,
-                "seasonType": "regular"
-            }
-            
-            stats = self._make_request("stats/team/season", params) or []
-            
-            if stats:
-                logging.info(f"Retrieved {len(stats)} season stats entries for {'team ' + team if team else 'all teams'}")
-                # Log first entry as sample if available
-                if len(stats) > 0:
-                    sample = stats[0]
-                    logging.info(f"Sample stats - Team: {sample.get('team')}, Games: {sample.get('games')}, Points: {sample.get('offense', {}).get('points', {}).get('total')}")
-            else:
-                logging.warning(f"No stats retrieved for {'team ' + team if team else 'all teams'}")
-            
-            return stats
-        except Exception as e:
-            logging.error(f"Error getting team stats: {str(e)}")
-            return []
+            logging.info(f"Retrieved {len(stats)} season stats entries")
+        
+        return stats
 
     def get_games(self, season: str, team: Optional[str] = None, status: str = "final") -> List[Dict]:
-        """Get basic games data with filters"""
+        """Get basic games data with caching"""
+        # Try to get from cache first
+        cached_data = self._load_cached_data("games", season)
+        if cached_data is not None and team:
+            # Filter cached data for specific team
+            team_games = [g for g in cached_data if team in (g.get('homeTeam'), g.get('awayTeam'))]
+            if team_games:
+                logging.info(f"Using cached games data for team {team}")
+                return team_games
+        
+        # If no cache or team not found, fetch from API
         params = {
             "season": season,
             "seasonType": "regular",
@@ -418,14 +491,13 @@ class BasketballDataCollector:
             
             logging.info(f"Retrieved {len(games)} games ({games_with_scores} with scores) for {'team ' + team if team else 'all teams'}")
             
-            if games_with_scores < len(games):
-                logging.warning(f"Only {games_with_scores} out of {len(games)} games have scores.")
-                if len(games) > 0:
-                    logging.debug(f"Sample game data: {json.dumps(games[0], indent=2)}")
+            # Update cache if fetching all games
+            if not team:
+                self._save_to_cache(games, "games", season)
         
         return games
 
-    def get_games_teams(self, season: str, team: Optional[str] = None) -> List[Dict]:
+    def get_games_teams(self, season: str, team: Optional[str] = None) -> List[Dict]:  
         """Get detailed team statistics for games"""
         params = {
             "season": season,
@@ -451,35 +523,122 @@ class BasketballDataCollector:
         return detailed_games
 
     def get_betting_lines(self, season: str, team: Optional[str] = None) -> List[Dict]:
-        """Get betting lines data"""
+        """Get betting lines data with caching"""
+        # Try to get from cache first
+        cached_data = self._load_cached_data("betting_lines", season)
+        if cached_data is not None and team:
+            # Filter cached data for specific team
+            team_lines = [l for l in cached_data 
+                         if team in (l.get('homeTeam'), l.get('awayTeam'))]
+            if team_lines:
+                logging.info(f"Using cached betting lines for {team}")
+                return team_lines
+        
+        # If no cache or team not found, fetch from API
         params = {
             "season": season,
             "team": team
         }
         lines = self._make_request("lines", params) or []
+        
         if lines:
+            # Update cache if fetching all lines
+            if not team:
+                self._save_to_cache(lines, "betting_lines", season)
+            
             logging.info(f"Retrieved {len(lines)} betting lines")
+        
         return lines
 
     def get_team_ratings(self, season: str, team: Optional[str] = None) -> Dict:
-        """Get both adjusted and SRS ratings"""
+        """Get both adjusted and SRS ratings with caching"""
+        # Try to get from cache first
+        cached_data = self._load_cached_data("ratings", season)
+        if cached_data is not None and team:
+            # Filter cached data for specific team
+            team_ratings = [r for r in cached_data if r.get('team') == team]
+            if team_ratings:
+                logging.info(f"Using cached ratings for {team}")
+                return team_ratings[0].get('ratings', {})
+        
+        # If no cache or team not found, fetch from API
         params = {"season": season, "team": team}
         adj_ratings = self._make_request("ratings/adjusted", params) or []
         srs_ratings = self._make_request("ratings/srs", params) or []
-        return {
+        
+        ratings_data = {
             "adjusted": adj_ratings,
             "srs": srs_ratings
         }
+        
+        # Update cache if fetching all ratings
+        if not team:
+            self._save_to_cache([{
+                "team": team,
+                "ratings": ratings_data
+            }], "ratings", season)
+        
+        return ratings_data
+
+    def _parallel_fetch(self, teams: List[Dict], season: str, fetch_type: str) -> Dict:
+        """Fetch data for multiple teams in parallel"""
+        results = {}
+        max_workers = min(10, len(teams))  # Limit concurrent requests
+        
+        def fetch_team_data(team: Dict) -> Tuple[str, Optional[List[Dict]]]:
+            team_name = team.get('school')
+            if not team_name:
+                return team_name, None
+            
+            try:
+                if fetch_type == 'stats':
+                    data = self.get_team_stats(season, team_name)
+                elif fetch_type == 'games':
+                    data = self.get_games(season, team_name)
+                elif fetch_type == 'betting_lines':
+                    data = self.get_betting_lines(season, team_name)
+                elif fetch_type == 'ratings':
+                    data = self.get_team_ratings(season, team_name)
+                else:
+                    return team_name, None
+                
+                return team_name, data
+            except Exception as e:
+                logging.error(f"Error fetching {fetch_type} for {team_name}: {str(e)}")
+                return team_name, None
+        
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_team = {
+                executor.submit(fetch_team_data, team): team 
+                for team in teams
+            }
+            
+            completed = 0
+            total = len(teams)
+            
+            for future in as_completed(future_to_team):
+                completed += 1
+                progress = (completed / total) * 100
+                self.progress_window.update(
+                    subtask=progress,
+                    detail=f"Fetching {fetch_type} ({completed}/{total} teams)"
+                )
+                
+                try:
+                    team_name, data = future.result()
+                    if team_name and data:
+                        results[team_name] = data
+                except Exception as e:
+                    team = future_to_team[future]
+                    logging.error(f"Error processing {team.get('school')}: {str(e)}")
+        
+        return results
 
     def collect_comprehensive_data(self, season: str):
         """Collect comprehensive data for analysis"""
         logging.info(f"Starting comprehensive data collection for season {season}")
         
         try:
-            # Reset progress tracking
-            self.total_operations = 0
-            self.completed_operations = 0
-            
             # Get all teams first
             self.progress_window.update(
                 status="Fetching teams list...",
@@ -501,199 +660,86 @@ class BasketballDataCollector:
             else:
                 logging.info(f"Analyzing all {total_teams} teams")
             
-            # Each team represents an equal portion of the total progress
-            progress_per_team = 100.0 / len(teams)
-            current_progress = 0.0
-            
-            # Update progress window with team count info
+            # Update progress window
             self.progress_window.update(
                 status=f"Processing {len(teams)} teams...",
-                detail=f"Starting data collection for {len(teams)} teams",
-                progress=current_progress
+                detail=f"Starting parallel data collection for {len(teams)} teams",
+                progress=0
             )
             
-            # Prepare data structures and tracking sets
-            games_data = []
-            team_stats = []
-            betting_lines = []
-            ratings_data = []
-            analyzed_teams = set()  # Track teams we've analyzed
-            seen_game_ids = set()  # Track game IDs we've seen
-            seen_betting_lines = set()  # Track betting lines we've seen
+            # Parallel fetch all data types
+            progress_increment = 25  # 25% per data type
             
-            # Process teams
-            for idx, team in enumerate(teams, 1):
-                team_name = team.get('school')
-                if not team_name:
-                    logging.warning(f"Skipping team with no name at index {idx}")
-                    continue
-                
-                # Add to analyzed teams set
-                analyzed_teams.add(team_name)
-                
-                # Add delay between requests to avoid rate limiting
-                if idx > 1:
-                    time.sleep(1)
-                
-                self.progress_window.update(
-                    status=f"Processing team {idx}/{len(teams)}",
-                    detail=f"Current team: {team_name}",
-                    progress=current_progress
-                )
-                
-                # Initialize empty data for this team
-                team_data = {
-                    'season': season,
-                    'seasonLabel': f"{int(season)-1}{season}",  # e.g., "20232024" for season "2024"
-                    'teamId': team.get('id'),
-                    'team': team_name,
-                    'conference': team.get('conference'),
-                    'games': 0,
-                    'wins': 0,
-                    'losses': 0,
-                    'totalMinutes': 0,
-                    'pace': 0,
-                    'offense': {
-                        'assists': 0,
-                        'blocks': 0,
-                        'steals': 0,
-                        'possessions': 0,
-                        'trueShooting': 0,
-                        'rating': 0,
-                        'fieldGoals': {'made': 0, 'attempted': 0, 'pct': 0},
-                        'twoPointFieldGoals': {'made': 0, 'attempted': 0, 'pct': 0},
-                        'threePointFieldGoals': {'made': 0, 'attempted': 0, 'pct': 0},
-                        'freeThrows': {'made': 0, 'attempted': 0, 'pct': 0},
-                        'rebounds': {'offensive': 0, 'defensive': 0, 'total': 0},
-                        'turnovers': {'total': 0, 'teamTotal': 0},
-                        'fouls': {'total': 0, 'technical': 0, 'flagrant': 0},
-                        'points': {'total': 0, 'inPaint': 0, 'offTurnovers': 0, 'fastBreak': 0},
-                        'fourFactors': {
-                            'effectiveFieldGoalPct': 0,
-                            'turnoverRatio': 0,
-                            'offensiveReboundPct': 0,
-                            'freeThrowRate': 0
-                        }
-                    },
-                    'defense': {
-                        'assists': 0,
-                        'blocks': 0,
-                        'steals': 0,
-                        'possessions': 0,
-                        'trueShooting': 0,
-                        'rating': 0,
-                        'fieldGoals': {'made': 0, 'attempted': 0, 'pct': 0},
-                        'twoPointFieldGoals': {'made': 0, 'attempted': 0, 'pct': 0},
-                        'threePointFieldGoals': {'made': 0, 'attempted': 0, 'pct': 0},
-                        'freeThrows': {'made': 0, 'attempted': 0, 'pct': 0},
-                        'rebounds': {'offensive': 0, 'defensive': 0, 'total': 0},
-                        'turnovers': {'total': 0, 'teamTotal': 0},
-                        'fouls': {'total': 0, 'technical': 0, 'flagrant': 0},
-                        'points': {'total': 0, 'inPaint': 0, 'offTurnovers': 0, 'fastBreak': 0},
-                        'fourFactors': {
-                            'effectiveFieldGoalPct': 0,
-                            'turnoverRatio': 0,
-                            'offensiveReboundPct': 0,
-                            'freeThrowRate': 0
-                        }
-                    }
-                }
-                
-                # Get games
-                self.progress_window.update(subtask=0, detail=f"Fetching games for {team_name}")
-                team_games = self.get_games(season, team_name)
+            # 1. Fetch games (0-25%)
+            self.progress_window.update(status="Fetching games data...")
+            games_results = self._parallel_fetch(teams, season, 'games')
+            self.progress_window.update(progress=25)
+            
+            # Save individual team's games data into separate JSON files
+            self._save_games_by_team(games_results, season)
+            
+            # 2. Fetch team stats (25-50%)
+            self.progress_window.update(status="Fetching team statistics...")
+            stats_results = self._parallel_fetch(teams, season, 'stats')
+            self.progress_window.update(progress=50)
+            
+            # 3. Fetch betting lines (50-75%)
+            self.progress_window.update(status="Fetching betting lines...")
+            betting_results = self._parallel_fetch(teams, season, 'betting_lines')
+            self.progress_window.update(progress=75)
+            
+            # 4. Fetch ratings (75-100%)
+            self.progress_window.update(status="Fetching team ratings...")
+            ratings_results = self._parallel_fetch(teams, season, 'ratings')
+            self.progress_window.update(progress=100)
+            
+            # Process and save results
+            self.progress_window.update(
+                status="Processing and saving data...",
+                detail="Combining and saving collected data",
+                subtask=0
+            )
+            
+            # Combine and deduplicate data
+            all_games = []
+            all_stats = []
+            all_betting_lines = []
+            all_ratings = []
+            seen_game_ids = set()
+            seen_betting_line_ids = set()
+            
+            for team_games in games_results.values():
                 if team_games:
-                    # Only add games we haven't seen before
                     for game in team_games:
                         game_id = game.get('id')
                         if game_id and game_id not in seen_game_ids:
                             seen_game_ids.add(game_id)
-                            games_data.append(game)
-                            
-                            # Update team's win/loss record
-                            if game.get('homeTeam') == team_name:
-                                if game.get('homePoints', 0) > game.get('awayPoints', 0):
-                                    team_data['wins'] += 1
-                                else:
-                                    team_data['losses'] += 1
-                            elif game.get('awayTeam') == team_name:
-                                if game.get('awayPoints', 0) > game.get('homePoints', 0):
-                                    team_data['wins'] += 1
-                                else:
-                                    team_data['losses'] += 1
-                            team_data['games'] += 1
-                self.progress_window.update(subtask=25)
-                
-                # Get team stats
-                self.progress_window.update(detail=f"Fetching stats for {team_name}")
-                team_season_stats = self.get_team_stats(season, team_name)
-                if team_season_stats:
-                    # Update team_data with any available stats
-                    for stat in team_season_stats:
-                        if stat.get('team') == team_name:
-                            # Use the API response data directly instead of our initialized structure
-                            team_data = stat
-                            team_stats.append(team_data)
-                            logging.info(f"Added complete stats for {team_name}")
-                            break
-                    else:
-                        logging.warning(f"No matching stats found for {team_name} in API response")
-                        team_stats.append(team_data)  # Add initialized data as fallback
-                else:
-                    logging.warning(f"Failed to get stats for {team_name}")
-                    team_stats.append(team_data)  # Add initialized data as fallback
-                self.progress_window.update(subtask=50)
-                
-                # Get betting lines
-                self.progress_window.update(detail=f"Fetching betting lines for {team_name}")
-                team_lines = self.get_betting_lines(season, team_name)
+                            all_games.append(game)
+            
+            for team_stats in stats_results.values():
+                if team_stats:
+                    all_stats.extend(team_stats)
+            
+            for team_lines in betting_results.values():
                 if team_lines:
-                    # Create unique identifier for each betting line using available fields
                     for line in team_lines:
-                        line_key = (
+                        line_id = (
                             str(line.get('gameId', '')),
-                            str(line.get('openDate', '')),
-                            str(line.get('homeTeam', '')),
-                            str(line.get('awayTeam', '')),
                             str(line.get('provider', ''))
                         )
-                        if line_key not in seen_betting_lines:
-                            seen_betting_lines.add(line_key)
-                            betting_lines.append(line)
-                self.progress_window.update(subtask=75)
-                
-                # Get ratings
-                self.progress_window.update(detail=f"Fetching ratings for {team_name}")
-                team_ratings = self.get_team_ratings(season, team_name)
-                if team_ratings:
-                    ratings_data.append({
-                        "team": team_name,
-                        "ratings": team_ratings
-                    })
-                else:
-                    # Include empty ratings for teams without data
-                    ratings_data.append({
-                        "team": team_name,
-                        "ratings": {"adjusted": [], "srs": []}
-                    })
-                self.progress_window.update(subtask=100)
-                
-                # Update main progress after completing each team
-                current_progress = min(100.0, (idx * progress_per_team))
-                self.progress_window.update(progress=current_progress)
+                        if line_id not in seen_betting_line_ids:
+                            seen_betting_line_ids.add(line_id)
+                            all_betting_lines.append(line)
+            
+            for team_rating in ratings_results.values():
+                if team_rating:
+                    all_ratings.append(team_rating)
             
             # Save all collected data
-            self.progress_window.update(
-                status="Saving collected data...",
-                detail="Processing and saving all data files",
-                subtask=0
-            )
-            
-            # Pass the analyzed teams set to summary generation
-            self._save_data_with_progress(games_data, "games", season)
-            self._save_data_with_progress(team_stats, "team_stats", season)
-            self._save_data_with_progress(betting_lines, "betting_lines", season)
-            self._save_data_with_progress(ratings_data, "ratings", season)
+            self._save_data_with_progress(all_games, "games", season)
+            self._save_data_with_progress(all_stats, "team_stats", season)
+            self._save_data_with_progress(all_betting_lines, "betting_lines", season)
+            self._save_data_with_progress(all_ratings, "ratings", season)
             
             # Generate summary
             self.progress_window.update(
@@ -702,14 +748,16 @@ class BasketballDataCollector:
                 progress=100,
                 subtask=100
             )
-            self._generate_summary_stats(games_data, team_stats, betting_lines, ratings_data, season, analyzed_teams)
+            
+            analyzed_teams = set(team.get('school') for team in teams if team.get('school'))
+            self._generate_summary_stats(all_games, all_stats, all_betting_lines, all_ratings, season, analyzed_teams)
             
             # Show completion
             self.progress_window.update(
                 status="Data collection complete!",
                 progress=100,
                 subtask=100,
-                detail=f"All operations finished successfully. Processed {len(analyzed_teams)} teams. Window will close automatically..."
+                detail=f"All operations finished successfully. Processed {len(analyzed_teams)} teams."
             )
             
         except Exception as e:
@@ -718,6 +766,9 @@ class BasketballDataCollector:
                 status="Error occurred during data collection",
                 detail=f"Error: {str(e)}. Window will close automatically..."
             )
+        finally:
+            # Clean up session
+            self.session.close()
 
     def _save_data_with_progress(self, data: List[Dict], data_type: str, season: str):
         """Save data to both JSON and CSV formats with progress tracking"""
@@ -725,48 +776,68 @@ class BasketballDataCollector:
             logging.warning(f"No {data_type} data to save")
             return
         
-        # Save as JSON
+        # Create a season-specific folder inside the output directory
+        season_folder = os.path.join(self.output_dir, season)
+        os.makedirs(season_folder, exist_ok=True)
+
+        json_file = os.path.join(season_folder, f"{data_type}.json")
         self.progress_window.update(
             detail=f"Saving {data_type} (JSON)",
             subtask=25
         )
-        json_file = os.path.join(self.output_dir, f"{season}_{data_type}.json")
         with open(json_file, 'w') as f:
             json.dump(data, f, indent=2)
         
-        # Process for CSV - properly flatten nested structures
+        # Process data for CSV using a comprehensive flattening function
         self.progress_window.update(
             detail=f"Processing {data_type} for CSV",
             subtask=50
         )
-        flattened_data = []
-        for item in data:
-            flat_item = {}
-            for key, value in item.items():
-                if isinstance(value, dict):
-                    # Handle nested dictionaries
-                    for sub_key, sub_value in value.items():
-                        if isinstance(sub_value, dict):
-                            # Handle doubly nested dictionaries (e.g., offense.fieldGoals)
-                            for sub_sub_key, sub_sub_value in sub_value.items():
-                                flat_item[f"{key}_{sub_key}_{sub_sub_key}"] = sub_sub_value
-                        else:
-                            flat_item[f"{key}_{sub_key}"] = sub_value
+        def flatten_data(d, parent_key='', sep='_'):
+            items = {}
+            for k, v in d.items():
+                new_key = f"{parent_key}{sep}{k}" if parent_key else k
+                if v is None:
+                    items[new_key] = ""
+                elif isinstance(v, dict):
+                    items.update(flatten_data(v, new_key, sep=sep))
+                elif isinstance(v, list):
+                    if all(isinstance(elem, (int, float, str, bool)) for elem in v):
+                        items[new_key] = ','.join(map(str, v))
+                    else:
+                        items[new_key] = json.dumps(v)
                 else:
-                    flat_item[key] = value
-            flattened_data.append(flat_item)
+                    items[new_key] = v
+            return items
         
-        # Save as CSV
+        # Flatten each data item
+        flattened_data = [flatten_data(item) for item in data]
+        
+        # Collect all headers (union of keys across all items)
+        header_set = set()
+        for item in flattened_data:
+            header_set.update(item.keys())
+        
+        # Define priority headers that should appear first if available
+        priority_headers = ['team', 'season', 'conference']
+        remaining_headers = sorted(list(header_set - set(priority_headers)))
+        csv_headers = [h for h in priority_headers if h in header_set] + remaining_headers
+        
+        # Ensure each flattened item has all headers
+        for item in flattened_data:
+            for header in csv_headers:
+                if header not in item:
+                    item[header] = None
+        
         self.progress_window.update(
             detail=f"Saving {data_type} (CSV)",
             subtask=75
         )
-        csv_file = os.path.join(self.output_dir, f"{season}_{data_type}.csv")
-        with open(csv_file, 'w', newline='') as f:
-            if flattened_data:  # Only proceed if we have data
-                writer = csv.DictWriter(f, fieldnames=flattened_data[0].keys())
-                writer.writeheader()
-                writer.writerows(flattened_data)
+        csv_file = os.path.join(season_folder, f"{data_type}.csv")
+        with open(csv_file, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.DictWriter(f, fieldnames=csv_headers)
+            writer.writeheader()
+            writer.writerows(flattened_data)
         
         self.progress_window.update(subtask=100)
         logging.info(f"Saved {data_type} data to {json_file} and {csv_file}")
@@ -837,6 +908,58 @@ class BasketballDataCollector:
                 status="Warning: Error in summary generation",
                 detail="Summary stats may be incomplete"
             )
+
+    def _save_games_by_team(self, games_results: Dict[str, List[Dict]], season: str):
+        """Save each team's games data into individual JSON and CSV files in a subdirectory."""
+        team_folder = os.path.join(self.output_dir, season, "teams")
+        os.makedirs(team_folder, exist_ok=True)
+
+        def flatten_data(d, parent_key='', sep='_'):
+            items = {}
+            for k, v in d.items():
+                new_key = f"{parent_key}{sep}{k}" if parent_key else k
+                if v is None:
+                    items[new_key] = ""
+                elif isinstance(v, dict):
+                    items.update(flatten_data(v, new_key, sep=sep))
+                elif isinstance(v, list):
+                    if all(isinstance(elem, (int, float, str, bool)) for elem in v):
+                        items[new_key] = ','.join(map(str, v))
+                    else:
+                        items[new_key] = json.dumps(v)
+                else:
+                    items[new_key] = v
+            return items
+
+        for team, games in games_results.items():
+            # Create a safe filename by removing unwanted characters and replacing spaces
+            safe_team = ''.join(c for c in team if c.isalnum() or c in (' ', '_', '-')).rstrip().replace(' ', '_')
+
+            # Save JSON file
+            json_file_path = os.path.join(team_folder, f"{safe_team}.json")
+            with open(json_file_path, 'w', encoding='utf-8') as f:
+                json.dump(games, f, indent=2)
+            logging.info(f"Saved games for team {team} to {json_file_path}")
+
+            # Prepare and save CSV file
+            flattened_games = [flatten_data(game) for game in games]
+            header_set = set()
+            for item in flattened_games:
+                header_set.update(item.keys())
+            csv_headers = sorted(list(header_set))
+
+            # Ensure each flattened game has all headers, fill missing with empty string
+            for game in flattened_games:
+                for header in csv_headers:
+                    if header not in game:
+                        game[header] = ""
+
+            csv_file_path = os.path.join(team_folder, f"{safe_team}.csv")
+            with open(csv_file_path, 'w', newline='', encoding='utf-8') as f:
+                writer = csv.DictWriter(f, fieldnames=csv_headers)
+                writer.writeheader()
+                writer.writerows(flattened_games)
+            logging.info(f"Saved CSV games for team {team} to {csv_file_path}")
 
 def run_data_collection(progress_window, season: str, max_teams: int):
     """Run data collection in a separate thread"""
