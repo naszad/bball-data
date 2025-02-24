@@ -3,4 +3,5 @@ python-dotenv==1.0.0
 beautifulsoup4==4.12.2
 lxml==5.1.0
 tqdm==4.66.1
-tk==0.1.0  # Only needed if not using system Python (most Python installations come with tkinter) 
+urllib3>=1.26.0   # Added to support retry functionality in the project
+tk==0.1.0  # Only needed if not using system Python (most Python installations come with tkinter)
