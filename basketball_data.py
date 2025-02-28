@@ -512,14 +512,17 @@ class BasketballDataCollector:
                 sample = detailed_games[0]
                 points = sample.get('offense', {}).get('points', {}).get('total')
                 logging.debug(f"Sample game points: {points}")
-                logging.debug(f"Sample game structure: {json.dumps({
+                # Create a dictionary for the JSON structure
+                sample_structure = {
                     'gameId': sample.get('gameId'),
                     'team': sample.get('team'),
                     'opponent': sample.get('opponent'),
                     'offensePoints': sample.get('offense', {}).get('points', {}).get('total'),
                     'defensePoints': sample.get('defense', {}).get('points', {}).get('total'),
                     'neutralSite': sample.get('neutralSite')
-                }, indent=2)}")
+                }
+                # Log the structure
+                logging.debug(f"Sample game structure: {json.dumps(sample_structure, indent=2)}")
         return detailed_games
 
     def get_betting_lines(self, season: str, team: Optional[str] = None) -> List[Dict]:
